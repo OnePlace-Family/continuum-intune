@@ -134,7 +134,7 @@ $manifest = [ordered]@{
         size     = $installer.Size
         sha256   = $installer.Sha256
         sha512   = $installer.Sha512Base64
-        signer   = $installer.SignerSubject
+        signer   = $installer.SignerName
     }
     package   = [ordered]@{
         fileName = $package.Name
