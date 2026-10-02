@@ -1,0 +1,83 @@
+name: CI
+
+# Lints the scripts and proves a full build, package check and smoke test on both
+# architectures. Never publishes anything.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -Repository PSGallery
+          Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1 -EnableExit -ReportSummary
+
+      - name: Constants in sync
+        shell: powershell
+        run: .\tests\Test-Constants.ps1
+
+  build-and-test:
+    name: build-and-test (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build kit
+        shell: powershell
+        run: .\Build-Kit.ps1 -Arch ${{ matrix.arch }}
+
+      - name: Read built version
+        id: built
+        shell: powershell
+        run: |
+          $manifest = Get-Content -Path "build\out\kit-manifest-${{ matrix.arch }}.json" -Raw | ConvertFrom-Json
+          "version=$($manifest.version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Package structure
+        shell: powershell
+        run: |
+          $installer = Get-ChildItem -Path build\source -Filter 'Continuum Setup*.exe' | Select-Object -First 1
+          .\tests\Test-Package.ps1 -Package "build\out\Continuum-${{ steps.built.outputs.version }}-${{ matrix.arch }}.intunewin" -InstallerPath $installer.FullName
+
+      - name: Smoke test
+        shell: powershell
+        run: .\tests\Smoke-Test.ps1 -SourceDir build\source -DetectScript build\out\Detect.ps1 -ExpectedVersion ${{ steps.built.outputs.version }} -Arch ${{ matrix.arch }}
+
+      - name: Release notes render
+        shell: pwsh
+        run: ./tools/New-ReleaseNotes.ps1 -ManifestDir build/out -Output build/release-notes.md; Get-Content build/release-notes.md
+
+      - name: Upload kit logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-smoke-logs-${{ matrix.arch }}
+          path: ${{ env.LOCALAPPDATA }}\ContinuumIntuneKit\*.log
+          if-no-files-found: ignore
+          retention-days: 7

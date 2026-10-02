@@ -1,0 +1,5 @@
+build/
+*.intunewin
+*.exe
+*.log
+release-notes.md

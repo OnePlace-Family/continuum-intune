@@ -1,0 +1,41 @@
+name: Deployment problem
+description: Continuum did not install, detect or uninstall correctly through Intune
+labels: [bug]
+body:
+  - type: input
+    id: release
+    attributes:
+      label: Package release
+      description: The release you downloaded from this repository, for example v1.3.10
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Package architecture
+      options: [x64, arm64, universal (built locally)]
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version on the device
+      description: Output of `winver` or `Get-ComputerInfo WindowsProductName, OsBuildNumber`
+  - type: dropdown
+    id: join
+    attributes:
+      label: Device join type
+      options: [Entra joined, Hybrid joined, Entra registered, Not sure]
+  - type: textarea
+    id: symptom
+    attributes:
+      label: What happened
+      description: Intune status shown in the admin center, any error code such as 0x87D1041C, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Kit logs
+      description: Contents of `%LOCALAPPDATA%\ContinuumIntuneKit\install.log` and `uninstall.log` on the device. Remove anything you consider sensitive.
+      render: text

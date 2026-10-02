@@ -1,0 +1,9 @@
+# Detect.ps1 is published as-is and its hash appears in release notes, so its bytes must not
+# depend on who cloned the repository or on which OS.
+*.ps1  text eol=crlf
+*.psd1 text eol=crlf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf

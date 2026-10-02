@@ -1,0 +1,410 @@
+name: Publish Intune package
+
+# Checks ToDesktop's production feed and, when it carries a version this repo has not
+# published yet, builds the x64 and arm64 packages, smoke-tests them on native runners and
+# publishes a GitHub Release. The feed only changes when a person clicks Release in the
+# ToDesktop dashboard, so this is a poll, not a hook. Dispatch it by hand after that click
+# when the weekly run is too slow.
+
+on:
+  schedule:
+    - cron: '23 14 * * 1' # Mondays, 14:23 UTC (10:23 Toronto during DST)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and test, upload the result as a workflow artifact, publish nothing
+        type: boolean
+        default: false
+      ignore_failed_marker:
+        description: Retry even if a publish-failed issue is open for this version
+        type: boolean
+        default: false
+
+concurrency:
+  group: publish-intune
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TODESKTOP_APP_ID: 250131q5s29r5
+
+jobs:
+  check:
+    name: Check ToDesktop feed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      version: ${{ steps.decide.outputs.version }}
+      publish: ${{ steps.decide.outputs.publish }}
+      reason: ${{ steps.decide.outputs.reason }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Read latest.yml
+        id: feed
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 "https://download.todesktop.com/${TODESKTOP_APP_ID}/latest.yml" -o latest.yml
+          version=$(yq -r '.version' latest.yml)
+          x64_sha=$(yq -r '.files[] | select(.url | test("-x64\\.exe$")) | .sha512' latest.yml)
+          arm64_sha=$(yq -r '.files[] | select(.url | test("-arm64\\.exe$")) | .sha512' latest.yml)
+          echo "Feed version: $version"
+          {
+            echo "version=$version"
+            echo "x64_sha=$x64_sha"
+            echo "arm64_sha=$arm64_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decide
+        id: decide
+        env:
+          VERSION: ${{ steps.feed.outputs.version }}
+          X64_SHA: ${{ steps.feed.outputs.x64_sha }}
+          ARM64_SHA: ${{ steps.feed.outputs.arm64_sha }}
+          IGNORE_FAILED_MARKER: ${{ inputs.ignore_failed_marker }}
+        run: |
+          set -euo pipefail
+          publish=false
+          anomaly=false
+          reason=""
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            reason="feed version '$VERSION' is not a release version"
+            anomaly=true
+          elif [ -z "$X64_SHA" ] || [ -z "$ARM64_SHA" ]; then
+            reason="latest.yml $VERSION is missing an x64 or arm64 installer"
+            anomaly=true
+          else
+            newest=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 --json tagName --jq '.[].tagName' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -n 1 || true)
+            echo "Newest published: ${newest:-none}"
+            if [ -z "$newest" ]; then
+              publish=true
+              reason="first release"
+            elif [ "$VERSION" = "$newest" ]; then
+              published_sha=$(gh release view "v$VERSION" --json body --jq .body | tr -d '\r' \
+                | grep -m1 '^Installer SHA-512 (x64):' | awk '{print $NF}' || true)
+              if [ "$published_sha" = "$X64_SHA" ]; then
+                reason="v$VERSION is already published with the same installer"
+              else
+                reason="ToDesktop re-released $VERSION with a different x64 installer than the published v$VERSION; a human must decide"
+                anomaly=true
+              fi
+            elif [ "$(printf '%s\n%s\n' "$newest" "$VERSION" | sort -V | tail -n 1)" = "$VERSION" ]; then
+              publish=true
+              reason="new version $VERSION (published: $newest)"
+            else
+              reason="feed is at $VERSION, older than the published $newest; not publishing a rollback"
+            fi
+          fi
+
+          if [ "$publish" = true ] && [ "$IGNORE_FAILED_MARKER" != "true" ]; then
+            open=$(gh issue list --label publish-failed --state open --search "\"v$VERSION\" in:title" --json number --jq 'length')
+            if [ "$open" != "0" ]; then
+              publish=false
+              reason="a publish-failed issue is open for v$VERSION; close it or dispatch with ignore_failed_marker"
+            fi
+          fi
+
+          echo "Decision: publish=$publish ($reason)"
+          {
+            echo "## ToDesktop feed check"
+            echo ""
+            echo "- Feed version: \`$VERSION\`"
+            echo "- Publish: **$publish**"
+            echo "- Reason: $reason"
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "version=$VERSION"
+            echo "publish=$publish"
+            echo "anomaly=$anomaly"
+            echo "reason=$reason"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Record feed anomaly
+        if: steps.decide.outputs.anomaly == 'true'
+        env:
+          VERSION: ${{ steps.feed.outputs.version }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Publish failed: v$VERSION"
+          existing=$(gh issue list --label publish-failed --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          body="The feed check could not publish v$VERSION.
+
+          $REASON
+
+          Run: $RUN_URL
+
+          Close this issue once resolved; the next scheduled run will retry. Or dispatch the workflow with \`ignore_failed_marker\`."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label publish-failed --body "$body"
+          fi
+
+      - name: Notify Slack of feed anomaly
+        if: steps.decide.outputs.anomaly == 'true'
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
+        with:
+          webhook: ${{ secrets.SLACK_DEPLOYMENTS_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            text: "⚠️ Intune package check needs a human"
+            blocks:
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "⚠️ *Intune package check needs a human*\n${{ steps.decide.outputs.reason }}"
+              - type: "actions"
+                elements:
+                  - type: "button"
+                    text:
+                      type: "plain_text"
+                      text: "View run"
+                    url: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: check
+    if: needs.check.outputs.publish == 'true' || inputs.dry_run == true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # shell: powershell is Windows PowerShell 5.1, the host Intune uses on devices.
+      - name: Build kit
+        shell: powershell
+        run: .\Build-Kit.ps1 -Arch ${{ matrix.arch }} -ExpectedVersion $env:VERSION
+
+      - name: Package structure
+        shell: powershell
+        run: |
+          $installer = Get-ChildItem -Path build\source -Filter 'Continuum Setup*.exe' | Select-Object -First 1
+          .\tests\Test-Package.ps1 -Package "build\out\Continuum-$env:VERSION-${{ matrix.arch }}.intunewin" -InstallerPath $installer.FullName
+
+      - name: Constants in sync
+        shell: powershell
+        run: .\tests\Test-Constants.ps1
+
+      - name: Smoke test
+        shell: powershell
+        run: .\tests\Smoke-Test.ps1 -SourceDir build\source -DetectScript build\out\Detect.ps1 -ExpectedVersion $env:VERSION -Arch ${{ matrix.arch }}
+
+      - name: Upload kit logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-logs-${{ matrix.arch }}
+          path: ${{ env.LOCALAPPDATA }}\ContinuumIntuneKit\*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload kit
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kit-${{ matrix.arch }}
+          path: build/out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: v${{ needs.check.outputs.version }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: kit-*
+          path: kits
+
+      - name: Assemble assets
+        run: |
+          set -euo pipefail
+          cmp kits/kit-x64/Detect.ps1 kits/kit-arm64/Detect.ps1
+          mkdir -p out
+          cp kits/kit-x64/* out/
+          cp kits/kit-arm64/*.intunewin kits/kit-arm64/kit-manifest-arm64.* out/
+          ls -l out
+
+      - name: Release notes
+        shell: pwsh
+        run: ./tools/New-ReleaseNotes.ps1 -ManifestDir out -Output release-notes.md
+
+      - name: Dry run artifact
+        if: env.DRY_RUN == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: continuum-intune-${{ env.VERSION }}-dry-run
+          path: |
+            out/*
+            release-notes.md
+          retention-days: 7
+
+      - name: Check for an existing release
+        id: existing
+        if: env.DRY_RUN != 'true'
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --json isDraft --jq .isDraft > state.txt 2>/dev/null; then
+            if [ "$(cat state.txt)" = "false" ]; then
+              echo "$TAG is already published; nothing to do"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Deleting leftover draft $TAG"
+            gh release delete "$TAG" --yes
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        if: env.DRY_RUN != 'true' && steps.existing.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "Continuum $VERSION for Intune" --notes-file release-notes.md out/*
+
+      - name: Verify uploaded assets
+        if: env.DRY_RUN != 'true' && steps.existing.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          expected=$(ls out | wc -l)
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"' | sort > remote.txt
+          (cd out && for f in *; do echo "$f $(stat -c %s "$f")"; done) | sort > local.txt
+          diff local.txt remote.txt
+          count=$(wc -l < remote.txt)
+          [ "$count" -eq "$expected" ] || { echo "Expected $expected assets, found $count"; exit 1; }
+          echo "All $count assets uploaded with matching sizes"
+
+      - name: Attest provenance
+        if: env.DRY_RUN != 'true' && steps.existing.outputs.skip != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/*.intunewin
+
+      - name: Publish
+        if: env.DRY_RUN != 'true' && steps.existing.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false --latest
+          echo "## Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/$GH_REPO/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Slack
+        if: env.DRY_RUN != 'true' && steps.existing.outputs.skip != 'true'
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
+        with:
+          webhook: ${{ secrets.SLACK_DEPLOYMENTS_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            text: "📦 Intune package published for Continuum ${{ env.VERSION }}"
+            blocks:
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "📦 *Intune package published*"
+              - type: "section"
+                fields:
+                  - type: "mrkdwn"
+                    text: "*Version:*\n`${{ env.VERSION }}`"
+                  - type: "mrkdwn"
+                    text: "*Architectures:*\nx64, arm64"
+                  - type: "mrkdwn"
+                    text: "*Triggered by:*\n${{ github.event_name == 'schedule' && 'weekly schedule' || github.actor }}"
+                  - type: "mrkdwn"
+                    text: "*Kit commit:*\n<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+              - type: "actions"
+                elements:
+                  - type: "button"
+                    text:
+                      type: "plain_text"
+                      text: "Open release"
+                    url: "${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ env.TAG }}"
+                    style: "primary"
+                  - type: "button"
+                    text:
+                      type: "plain_text"
+                      text: "View run"
+                    url: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  on-failure:
+    name: Report failure
+    needs: [check, build, release]
+    if: failure() && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.check.outputs.version }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update the publish-failed issue
+        run: |
+          set -euo pipefail
+          title="Publish failed: v${VERSION:-unknown}"
+          existing=$(gh issue list --label publish-failed --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          body="The publish workflow failed for v${VERSION:-unknown}.
+
+          Run: $RUN_URL
+
+          Scheduled runs skip this version while this issue is open. Close it once the cause is fixed, or dispatch the workflow with \`ignore_failed_marker\`."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label publish-failed --body "$body"
+          fi
+
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
+        with:
+          webhook: ${{ secrets.SLACK_DEPLOYMENTS_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            text: "❌ Intune package publish failed for Continuum ${{ env.VERSION }}"
+            blocks:
+              - type: "section"
+                text:
+                  type: "mrkdwn"
+                  text: "❌ *Intune package publish failed*\nVersion `${{ env.VERSION }}`. A `publish-failed` issue has been opened; scheduled runs skip this version until it is closed."
+              - type: "actions"
+                elements:
+                  - type: "button"
+                    text:
+                      type: "plain_text"
+                      text: "View run"
+                    url: "${{ env.RUN_URL }}"
+                    style: "danger"

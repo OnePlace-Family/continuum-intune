@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Continuum support
+    url: mailto:support@oncontinuum.com
+    about: Questions about Continuum itself, accounts or licensing. This repository only covers Intune packaging.
+  - name: Security report
+    url: mailto:security@oncontinuum.com
+    about: Please do not open public issues for security problems. See SECURITY.md.
