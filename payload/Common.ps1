@@ -2,9 +2,7 @@
 # extracted .intunewin folder. Detect.ps1 is uploaded to Intune on its own and therefore
 # duplicates what it needs instead of dot-sourcing this file.
 #
-# Values verified against the production installer 1.3.10 (ToDesktop app 250131q5s29r5):
-# one-click, per-user NSIS; registry identity is the electron-builder GUID derived from
-# appId com.oncontinuum.desktop; install folder is named after package.json "name".
+# Identity of Continuum's per-user NSIS install: uninstall GUID, exe and folder names.
 
 $script:ContinuumGuid = '814ecc71-30fe-5c71-b9c9-65458b992584'
 $script:ContinuumUninstallSubKey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\$script:ContinuumGuid"

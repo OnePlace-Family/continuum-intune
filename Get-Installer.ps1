@@ -17,7 +17,7 @@
 #      -ExpectedSigner. This is what stops a swapped file at the feed from being packaged.
 #
 # Returns one object on the pipeline: Version, Arch, FileName, Path, Url, Size, Sha256,
-# Sha512Base64, SignerSubject. Progress text goes to the host, not the pipeline.
+# Sha512Base64, SignerName. Progress text goes to the host, not the pipeline.
 
 [CmdletBinding()]
 param(
@@ -127,5 +127,5 @@ Write-Host "Saved to $destination ($($file.Length) bytes)"
     Size          = $file.Length
     Sha256        = (Get-FileHash -Path $destination -Algorithm SHA256).Hash
     Sha512Base64  = $sha512
-    SignerSubject = $signature.SignerCertificate.Subject
+    SignerName     = $signerName
 }
