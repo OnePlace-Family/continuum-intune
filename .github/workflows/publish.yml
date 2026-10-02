@@ -151,6 +151,8 @@ jobs:
           fi
 
       - name: Notify Slack of feed anomaly
+
+        continue-on-error: true
         if: steps.decide.outputs.anomaly == 'true'
         uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
         with:
@@ -322,6 +324,8 @@ jobs:
           echo "https://github.com/$GH_REPO/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notify Slack
+
+        continue-on-error: true
         if: env.DRY_RUN != 'true' && steps.existing.outputs.skip != 'true'
         uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
         with:
@@ -389,6 +393,8 @@ jobs:
           fi
 
       - name: Notify Slack
+
+        continue-on-error: true
         uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
         with:
           webhook: ${{ secrets.SLACK_DEPLOYMENTS_WEBHOOK_URL }}
